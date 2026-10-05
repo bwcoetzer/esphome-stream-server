@@ -6,6 +6,10 @@ from esphome.util import parse_esphome_version
 
 # ESPHome doesn't know the Stream abstraction yet, so hardcode to use a UART for now.
 
+CONF_MAX_CLIENTS = "max_clients"
+CONF_IDLE_TIMEOUT = "idle_timeout"
+CONF_KEEPALIVE = "keepalive"
+
 AUTO_LOAD = ["socket"]
 
 DEPENDENCIES = ["uart", "network"]
@@ -31,6 +35,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BUFFER_SIZE, default=128): cv.All(
                 cv.positive_int, validate_buffer_size
             ),
+            cv.Optional(CONF_MAX_CLIENTS, default=0): cv.positive_int,
+            cv.Optional(CONF_IDLE_TIMEOUT, default="0s"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_KEEPALIVE, default="0s"): cv.positive_time_period_seconds,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -42,6 +49,9 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_buffer_size(config[CONF_BUFFER_SIZE]))
+    cg.add(var.set_max_clients(config[CONF_MAX_CLIENTS]))
+    cg.add(var.set_idle_timeout(config[CONF_IDLE_TIMEOUT].total_milliseconds))
+    cg.add(var.set_keepalive(config[CONF_KEEPALIVE].total_seconds))
 
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)

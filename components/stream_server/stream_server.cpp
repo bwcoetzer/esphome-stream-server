@@ -5,6 +5,12 @@
 #include "esphome/core/util.h"
 #include "esphome/core/version.h"
 
+#include "esphome/core/hal.h"
+#ifdef USE_ESP32
+#include <lwip/sockets.h>
+#include <lwip/opt.h>
+#include <lwip/tcp.h>
+#endif
 #include "esphome/components/network/util.h"
 #include "esphome/components/socket/socket.h"
 
@@ -43,12 +49,17 @@ void StreamServerComponent::loop() {
     this->read();
     this->flush();
     this->write();
+    this->enforce_limits();
     this->cleanup();
+    this->publish_socket_stats();
 }
 
 void StreamServerComponent::dump_config() {
     ESP_LOGCONFIG(TAG, "Stream Server:");
-#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 7, 0)
+    char use_address[esphome::network::USE_ADDRESS_BUFFER_SIZE];
+    ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address_to(use_address), this->port_);
+#elif ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
     ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address(), this->port_);
 #else
     ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address().c_str(), this->port_);
@@ -58,7 +69,13 @@ void StreamServerComponent::dump_config() {
 #endif
 #ifdef USE_SENSOR
     LOG_SENSOR("  ", "Connection count:", this->connection_count_sensor_);
+    LOG_SENSOR("  ", "Sockets used:", this->sockets_used_sensor_);
+    LOG_SENSOR("  ", "Sockets max:", this->sockets_max_sensor_);
+    LOG_SENSOR("  ", "Dropped clients:", this->dropped_clients_sensor_);
 #endif
+    ESP_LOGCONFIG(TAG, "  Max clients: %u (0 = unlimited)", (unsigned) this->max_clients_);
+    ESP_LOGCONFIG(TAG, "  Idle timeout: %u ms (0 = off)", (unsigned) this->idle_timeout_ms_);
+    ESP_LOGCONFIG(TAG, "  TCP keepalive idle: %u s (0 = off)", (unsigned) this->keepalive_idle_s_);
 }
 
 void StreamServerComponent::on_shutdown() {
@@ -91,6 +108,19 @@ void StreamServerComponent::accept() {
 
     socket->setblocking(false);
 
+    if (this->keepalive_idle_s_ > 0) {
+        // Let lwIP notice peers that vanished without a FIN/RST (dead link, killed container), instead of
+        // keeping the client - and its socket table entry - forever.
+        int enable = 1;
+        int idle = this->keepalive_idle_s_;
+        int interval = std::max(1, idle / 3);
+        int count = 3;
+        socket->setsockopt(SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+        socket->setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        socket->setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+        socket->setsockopt(IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+    }
+
 #if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 1, 0)
     std::string identifier = std::string{esphome::socket::SOCKADDR_STR_LEN, 0};
     auto identifier_span = std::span<char, esphome::socket::SOCKADDR_STR_LEN>(identifier.data(), identifier.size());
@@ -100,6 +130,7 @@ void StreamServerComponent::accept() {
 #endif
 
     this->clients_.emplace_back(std::move(socket), identifier, this->buf_head_);
+    this->clients_.back().last_activity = esphome::millis();
     ESP_LOGD(TAG, "New client connected from %s", identifier.c_str());
     this->publish_sensor();
 }
@@ -157,6 +188,7 @@ void StreamServerComponent::flush() {
         iov[1].iov_len = this->buf_head_ - (client.position + iov[0].iov_len);
         if ((written = client.socket->writev(iov, 2)) > 0) {
             client.position += written;
+            client.last_activity = esphome::millis();
         } else if (written == 0 || errno == ECONNRESET) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
@@ -164,7 +196,12 @@ void StreamServerComponent::flush() {
         } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
             // Expected if the (TCP) transmit buffer is full, nothing to do.
         } else {
-            ESP_LOGE(TAG, "Failed to write to client %s with error %d!", client.identifier.c_str(), errno);
+            // Any other error (ENOTCONN, EPIPE, ETIMEDOUT, ...) is fatal for this connection. Keeping the client
+            // would pin buf_tail_ behind its frozen position and hold on to its socket table entry forever.
+            ESP_LOGW(TAG, "Failed to write to client %s with error %d, dropping it", client.identifier.c_str(), errno);
+            client.disconnected = true;
+            this->dropped_clients_++;
+            continue;
         }
 
         this->buf_tail_ = std::min(this->buf_tail_, client.position);
@@ -178,8 +215,10 @@ void StreamServerComponent::write() {
         if (client.disconnected)
             continue;
 
-        while ((read = client.socket->read(&buf, sizeof(buf))) > 0)
+        while ((read = client.socket->read(&buf, sizeof(buf))) > 0) {
             this->stream_->write_array(buf, read);
+            client.last_activity = esphome::millis();
+        }
 
         if (read == 0 || errno == ECONNRESET) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
@@ -187,9 +226,78 @@ void StreamServerComponent::write() {
         } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
             // Expected if the (TCP) receive buffer is empty, nothing to do.
         } else {
-            ESP_LOGW(TAG, "Failed to read from client %s with error %d!", client.identifier.c_str(), errno);
+            ESP_LOGW(TAG, "Failed to read from client %s with error %d, dropping it", client.identifier.c_str(), errno);
+            client.disconnected = true;
+            this->dropped_clients_++;
         }
     }
+}
+
+void StreamServerComponent::enforce_limits() {
+    uint32_t now = esphome::millis();
+
+    if (this->idle_timeout_ms_ > 0) {
+        for (Client &client : this->clients_) {
+            if (!client.disconnected && now - client.last_activity > this->idle_timeout_ms_) {
+                ESP_LOGW(TAG, "Client %s idle for over %u ms, dropping it", client.identifier.c_str(),
+                         (unsigned) this->idle_timeout_ms_);
+                client.disconnected = true;
+                this->dropped_clients_++;
+            }
+        }
+    }
+
+    if (this->max_clients_ > 0) {
+        // Evict the least recently active clients first: a reconnecting consumer is far more likely to be the
+        // live one than the oldest connection.
+        while (true) {
+            size_t live = 0;
+            Client *stalest = nullptr;
+            for (Client &client : this->clients_) {
+                if (client.disconnected)
+                    continue;
+                live++;
+                if (stalest == nullptr || (int32_t)(stalest->last_activity - client.last_activity) > 0)
+                    stalest = &client;
+            }
+            if (live <= this->max_clients_ || stalest == nullptr)
+                break;
+            ESP_LOGW(TAG, "More than %u clients, dropping least active client %s", (unsigned) this->max_clients_,
+                     stalest->identifier.c_str());
+            stalest->disconnected = true;
+            this->dropped_clients_++;
+        }
+    }
+}
+
+void StreamServerComponent::publish_socket_stats() {
+#ifdef USE_SENSOR
+    uint32_t now = esphome::millis();
+    if (now - this->last_socket_stats_ < 10000)
+        return;
+    this->last_socket_stats_ = now;
+
+    if (this->dropped_clients_sensor_)
+        this->dropped_clients_sensor_->publish_state(this->dropped_clients_);
+
+#ifdef USE_ESP32
+    if (this->sockets_used_sensor_ || this->sockets_max_sensor_) {
+        // lwIP hands out file descriptors in [LWIP_SOCKET_OFFSET, LWIP_SOCKET_OFFSET + MEMP_NUM_NETCONN). A slot
+        // that is free reports EBADF.
+        int used = 0;
+        for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + MEMP_NUM_NETCONN; fd++) {
+            int type;
+            socklen_t len = sizeof(type);
+            if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0)
+                used++;
+        }
+        if (this->sockets_used_sensor_)
+            this->sockets_used_sensor_->publish_state(used);
+        if (this->sockets_max_sensor_)
+            this->sockets_max_sensor_->publish_state(MEMP_NUM_NETCONN);
+    }
+#endif
+#endif
 }
 
 StreamServerComponent::Client::Client(std::unique_ptr<esphome::socket::Socket> socket, std::string identifier, size_t position)
